@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+*.egg-info/
+
+# Go
+services/worker/bin/
+*.exe
+*.test
+vendor/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local runtime
+.env
+*.log
+data/
+tmp/
+.benchmarks/
