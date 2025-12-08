@@ -1,0 +1,50 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build:
+      context: ./services/gateway
+    environment:
+      PULSEBRIDGE_REDIS_URL: redis://redis:6379/0
+      PULSEBRIDGE_STREAM_KEY: pulsebridge.events
+      PULSEBRIDGE_RATE_LIMIT_RPS: "200"
+      PULSEBRIDGE_LOG_LEVEL: INFO
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./services/worker
+    environment:
+      PULSEBRIDGE_REDIS_URL: redis://redis:6379/0
+      PULSEBRIDGE_STREAM_KEY: pulsebridge.events
+      PULSEBRIDGE_GROUP: pulsebridge-workers
+      PULSEBRIDGE_CONSUMER: worker-1
+      PULSEBRIDGE_CONCURRENCY: "64"
+    depends_on:
+      redis:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - gateway
+      - worker
