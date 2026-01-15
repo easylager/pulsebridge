@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pulsebridge.dev/schemas/event-envelope.json",
+  "title": "PulseBridge Event Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "tenant_id", "event_type", "payload", "occurred_at", "correlation_id"],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "tenant_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "event_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "payload": { "type": "object" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "correlation_id": { "type": "string", "minLength": 1, "maxLength": 64 }
+  }
+}
