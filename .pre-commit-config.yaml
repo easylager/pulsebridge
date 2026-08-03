@@ -1,0 +1,53 @@
+# Fast checks only. Anything slower than a couple of seconds belongs in CI —
+# a pre-commit hook people disable to get work done is worse than no hook.
+#
+#   pip install pre-commit && pre-commit install
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # Compose uses YAML anchors, which the naive parser rejects.
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^(services/gateway|scripts)/
+      - id: ruff-format
+        files: ^(services/gateway|scripts)/
+
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        entry: bash -c 'cd services/worker && test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
+        language: system
+        files: \.go$
+        pass_filenames: false
+
+      - id: go-vet
+        name: go vet
+        entry: bash -c 'cd services/worker && go vet ./...'
+        language: system
+        files: \.go$
+        pass_filenames: false
+
+      # The committed spec is what reviewers read; regenerating it here means the
+      # change lands in the same commit as the API change that caused it.
+      - id: openapi-current
+        name: openapi spec is current
+        entry: uv run --project services/gateway python scripts/export_openapi.py --check
+        language: system
+        files: ^services/gateway/src/pulsebridge_gateway/(api|domain)/
+        pass_filenames: false
