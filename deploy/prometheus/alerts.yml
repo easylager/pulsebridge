@@ -1,0 +1,148 @@
+# Alert rules for PulseBridge.
+#
+# Each rule maps to a numbered step in docs/runbook.md. An alert without a
+# documented response is a pager that teaches people to ignore pagers, so the
+# runbook link is part of the contract rather than decoration.
+#
+# The rules are deliberately symptom-based: they fire on what a caller or a
+# downstream consumer would notice, not on internal states that may be perfectly
+# normal (a non-zero pending list, for example, is expected under load and only
+# matters when it stops draining).
+
+groups:
+  - name: pulsebridge-ingest
+    rules:
+      - alert: IngestErrorBudgetBurn
+        expr: |
+          sum(rate(pulsebridge_ingest_total{result="unavailable"}[5m]))
+            /
+          clamp_min(sum(rate(pulsebridge_ingest_total[5m])), 0.001)
+            > 0.01
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Gateway is rejecting events it cannot publish"
+          description: >-
+            More than 1% of ingest attempts returned 503 over the last 5 minutes.
+            The events were not written to the stream, so producers must retry.
+          runbook: "docs/runbook.md#ingest-returning-503"
+
+      - alert: IngestLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(pulsebridge_ingest_latency_seconds_bucket[5m])) by (le)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p99 ingest latency above the 50ms objective"
+          description: >-
+            The ingest path is dominated by three Redis round trips; sustained
+            p99 growth usually means Redis saturation or connection-pool
+            contention rather than application CPU.
+          runbook: "docs/runbook.md#ingest-latency-regression"
+
+      - alert: TenantSustainedThrottling
+        expr: |
+          sum(rate(pulsebridge_ingest_total{result="rate_limited"}[15m]))
+            /
+          clamp_min(sum(rate(pulsebridge_ingest_total[15m])), 0.001)
+            > 0.25
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A quarter of ingest traffic is being throttled"
+          description: >-
+            Either a tenant is misbehaving or its quota no longer matches its
+            legitimate volume. Both need a human decision, not an auto-raise.
+          runbook: "docs/runbook.md#sustained-throttling"
+
+  - name: pulsebridge-consumption
+    rules:
+      # Backlog depth alone is a poor signal: a healthy consumer under load has a
+      # non-empty pending list. Age is what separates "behind" from "stuck".
+      - alert: ConsumerBacklogStuck
+        expr: pulsebridge_worker_oldest_pending_seconds > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Oldest unacknowledged event has been stuck for over 5 minutes"
+          description: >-
+            A consumer died mid-flight or a handler is wedged. Reclaim should
+            recover it automatically; if this alert persists, reclaim itself is
+            failing.
+          runbook: "docs/runbook.md#backlog-not-draining"
+
+      - alert: ConsumerBacklogGrowing
+        expr: |
+          delta(pulsebridge_worker_pending_entries[15m]) > 0
+            and
+          pulsebridge_worker_pending_entries > 1000
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Pending entries growing for 15 minutes"
+          description: >-
+            Consumption is slower than production. Scale the worker pool or
+            reduce per-event work before the stream trim starts dropping data.
+          runbook: "docs/runbook.md#backlog-not-draining"
+
+      - alert: DeadLetterRateElevated
+        expr: sum(rate(pulsebridge_worker_dead_lettered_total[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Events are being quarantined"
+          description: >-
+            Sustained dead-lettering means a systemic problem: a producer change,
+            a schema mismatch, or a downstream that is down long enough to burn
+            the retry budget.
+          runbook: "docs/runbook.md#dead-letter-spike"
+
+      # This is the one failure with no safety net: the event is neither applied
+      # nor quarantined.
+      - alert: DeadLetterWritesFailing
+        expr: increase(pulsebridge_worker_dead_letter_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Cannot write to the dead-letter stream"
+          description: >-
+            Quarantine is unavailable, so poison messages stay in the pending
+            list and are retried indefinitely.
+          runbook: "docs/runbook.md#dead-letter-writes-failing"
+
+      - alert: RetryStormDetected
+        expr: |
+          sum(rate(pulsebridge_worker_retries_total[10m]))
+            /
+          clamp_min(sum(rate(pulsebridge_worker_processed_total[10m])), 0.001)
+            > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "More than 10% of deliveries are redeliveries"
+          description: >-
+            Either a downstream is flapping, or ReclaimMinIdle is too close to
+            the handler timeout and healthy work is being reclaimed.
+          runbook: "docs/runbook.md#retry-storm"
+
+  - name: pulsebridge-availability
+    rules:
+      - alert: ServiceDown
+        expr: up{job=~"pulsebridge-.*"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }} is not being scraped"
+          runbook: "docs/runbook.md#service-down"
