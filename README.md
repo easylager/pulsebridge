@@ -8,7 +8,7 @@ retries, dead-lettering, and recovery from consumer death. Both sides are traced
 end to end, measured, and covered by tests that exercise the failure paths rather
 than the happy one.
 
-[![CI](https://github.com/maksimvasilenko/pulsebridge/actions/workflows/ci.yml/badge.svg)](https://github.com/maksimvasilenko/pulsebridge/actions/workflows/ci.yml)
+[![CI](https://github.com/easylager/pulsebridge/actions/workflows/ci.yml/badge.svg)](https://github.com/easylager/pulsebridge/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B%20asyncio-blue)
 ![go](https://img.shields.io/badge/go-1.25-00ADD8)
 ![otel](https://img.shields.io/badge/OpenTelemetry-traced-425cc7)
@@ -42,6 +42,22 @@ flowchart LR
 | **On overload** | Degrades into queueing — measured: no 5xx, no data loss |
 | **Measured knee** | ~500 rps per gateway process, p99 under 50 ms to ~400 rps |
 | **Tracing** | One trace spans HTTP request → Redis → Go handler |
+
+---
+
+## What it looks like running
+
+The dashboard is provisioned with the stack — this is a capture at 400 rps, with
+the alert rules from [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml)
+watching the same series.
+
+![Grafana dashboard: ingest and consumption](docs/assets/grafana-dashboard.png)
+
+One trace, two languages: the gateway's `POST /v1/events` span and the Go
+worker's `pulsebridge.events process` span, linked across Redis by a
+`traceparent` carried on the stream entry.
+
+![Jaeger trace spanning gateway and worker](docs/assets/jaeger-trace.png)
 
 ---
 
