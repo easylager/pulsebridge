@@ -4,8 +4,10 @@ import json
 import time
 
 from redis.asyncio import Redis
+from redis.typing import EncodableT, FieldT
 
 from pulsebridge_gateway.domain.events import EventEnvelope, EventId, TenantId
+from pulsebridge_gateway.infrastructure.telemetry import TRACEPARENT_FIELD, current_traceparent
 
 
 class RedisIdempotencyStore:
@@ -20,13 +22,23 @@ class RedisIdempotencyStore:
         return bool(await self._redis.exists(self._key(event_id)))
 
     async def remember(self, event_id: EventId, ttl_seconds: int) -> bool:
-        # SET NX → True if newly stored
+        # SET NX is atomic across gateway replicas, so exactly one concurrent
+        # request for a given event id gets True and proceeds to publish.
         ok = await self._redis.set(self._key(event_id), "1", ex=ttl_seconds, nx=True)
         return bool(ok)
 
+    async def forget(self, event_id: EventId) -> None:
+        await self._redis.delete(self._key(event_id))
+
 
 class RedisTokenBucketLimiter:
-    """Per-tenant token bucket using a small Lua script (atomic)."""
+    """Per-tenant token bucket using a small Lua script.
+
+    The read-modify-write of the bucket has to be atomic, otherwise two gateway
+    replicas refill from the same stale timestamp and a tenant gets roughly
+    double its quota. Lua runs server-side in one step, which is cheaper and
+    simpler than WATCH/MULTI retry loops on a hot path.
+    """
 
     _SCRIPT = """
     local key = KEYS[1]
@@ -76,23 +88,29 @@ class RedisTokenBucketLimiter:
 
 
 class RedisStreamPublisher:
-    def __init__(self, redis: Redis, *, stream_key: str) -> None:
+    def __init__(self, redis: Redis, *, stream_key: str, max_len: int = 1_000_000) -> None:
         self._redis = redis
         self._stream_key = stream_key
+        self._max_len = max_len
 
     async def publish(self, event: EventEnvelope) -> str:
         wire = event.to_wire()
+        fields: dict[FieldT, EncodableT] = {
+            "event_id": wire["event_id"],
+            "tenant_id": wire["tenant_id"],
+            "event_type": wire["event_type"],
+            "payload": json.dumps(wire["payload"], separators=(",", ":")),
+            "occurred_at": wire["occurred_at"],
+            "correlation_id": wire["correlation_id"],
+            # Carrying the trace context on the entry is what lets the Go worker
+            # attach its processing span to the HTTP request that produced the
+            # event, instead of starting an orphan trace.
+            TRACEPARENT_FIELD: current_traceparent(),
+        }
         message_id = await self._redis.xadd(
             self._stream_key,
-            {
-                "event_id": wire["event_id"],
-                "tenant_id": wire["tenant_id"],
-                "event_type": wire["event_type"],
-                "payload": json.dumps(wire["payload"], separators=(",", ":")),
-                "occurred_at": wire["occurred_at"],
-                "correlation_id": wire["correlation_id"],
-            },
-            maxlen=1_000_000,
+            fields,
+            maxlen=self._max_len,
             approximate=True,
         )
         return str(message_id)

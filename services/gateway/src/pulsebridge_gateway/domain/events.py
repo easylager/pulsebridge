@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, NewType
 from uuid import uuid4
 
@@ -46,7 +46,7 @@ class EventEnvelope:
             tenant_id=TenantId(tenant_id.strip()),
             event_type=event_type.strip(),
             payload=payload,
-            occurred_at=occurred_at or datetime.now(timezone.utc),
+            occurred_at=occurred_at or datetime.now(UTC),
             correlation_id=correlation_id or str(uuid4()),
         )
 
