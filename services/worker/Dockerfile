@@ -11,7 +11,7 @@ COPY . .
 # result run in a distroless-style image with no libc.
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/worker ./cmd/worker
 
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates wget \
     && adduser -D -u 10001 worker
 COPY --from=build /out/worker /usr/local/bin/worker
