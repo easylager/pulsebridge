@@ -5,39 +5,210 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same branch makes the previous run's result irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+  PYTHON_VERSION: "3.12"
+
 jobs:
   gateway:
+    name: gateway · lint, types, unit
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: services/gateway
     steps:
       - uses: actions/checkout@v4
+
       - uses: astral-sh/setup-uv@v4
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      # --frozen fails if the lockfile does not match pyproject.toml, so a
+      # dependency change that skipped `uv lock` cannot reach main.
       - name: Install
-        run: uv sync
+        run: uv sync --frozen --all-groups
+
       - name: Lint
-        run: uv run ruff check src tests
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
       - name: Types
         run: uv run mypy src
-      - name: Tests
-        run: uv run pytest -q
+
+      - name: Unit tests
+        run: uv run pytest -q -m "not integration" --cov --cov-report=term-missing
+
+  gateway-integration:
+    name: gateway · integration (real Redis)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/gateway
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen --all-groups
+
+      # These tests skip themselves when Redis is unreachable, which is right for
+      # a laptop and wrong here: a silent skip would hide a real break.
+      # PULSEBRIDGE_REQUIRE_REDIS turns that skip into a failure.
+      - name: Integration tests
+        env:
+          PULSEBRIDGE_TEST_REDIS_URL: redis://localhost:6379/15
+          PULSEBRIDGE_REQUIRE_REDIS: "1"
+        run: uv run pytest -q -m integration -rs
 
   worker:
+    name: worker · vet, race tests
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: services/worker
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/worker/go.sum
+
       - name: Download modules
-        run: go mod tidy && go mod download
-      - name: Build
-        run: go build ./...
+        run: go mod download
+
+      # `go mod tidy` in CI would paper over an untidy go.mod instead of
+      # reporting it, so it is checked rather than run.
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
       - name: Vet
         run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # The reclaim, retry and drain paths are all concurrent; without -race the
+      # tests would pass on a data race that only bites in production.
+      - name: Tests
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+  contracts:
+    name: contracts · OpenAPI drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen --all-groups --project services/gateway
+
+      # The committed spec is what reviewers and client generators read. A stale
+      # one is worse than none, because it is trusted.
+      - name: Check committed OpenAPI is current
+        run: uv run --project services/gateway python scripts/export_openapi.py --check
+
+  stack:
+    name: stack · compose smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Ingest is accepted
+        run: |
+          code=$(curl -s -o /tmp/body -w '%{http_code}' localhost:8080/v1/events \
+            -H 'content-type: application/json' \
+            -d '{"tenant_id":"acme","event_type":"order.created","payload":{"id":"1"},"event_id":"ci-1"}')
+          cat /tmp/body; echo
+          test "$code" = "202" || { echo "expected 202, got $code"; exit 1; }
+
+      - name: Replay is reported as a duplicate, not an error
+        run: |
+          code=$(curl -s -o /tmp/body -w '%{http_code}' localhost:8080/v1/events \
+            -H 'content-type: application/json' \
+            -d '{"tenant_id":"acme","event_type":"order.created","payload":{"id":"1"},"event_id":"ci-1"}')
+          cat /tmp/body; echo
+          test "$code" = "200" || { echo "expected 200, got $code"; exit 1; }
+
+      - name: Worker consumed the event
+        run: |
+          for _ in $(seq 1 20); do
+            applied=$(docker compose exec -T redis redis-cli HGET pb:worker:events 'acme|order.created')
+            [ "$applied" = "1" ] && exit 0
+            sleep 1
+          done
+          echo "::error::worker never applied the event"
+          docker compose logs worker-1 worker-2
+          exit 1
+
+      # The dead-letter path is the guarantee that is easiest to break silently,
+      # so the smoke test exercises it rather than trusting the unit tests alone.
+      - name: Poison message is quarantined, not stranded
+        run: |
+          docker compose exec -T redis redis-cli XADD pulsebridge.events '*' \
+            tenant_id acme event_type order.created payload '{"broken"'
+          for _ in $(seq 1 20); do
+            n=$(docker compose exec -T redis redis-cli XLEN pulsebridge.events.dlq)
+            if [ "$n" -ge 1 ]; then
+              pending=$(docker compose exec -T redis redis-cli XLEN pulsebridge.events.dlq)
+              echo "dlq entries: $pending"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::poison message never reached the dead-letter stream"
+          docker compose logs worker-1 worker-2
+          exit 1
+
+      - name: Both services expose metrics
+        run: |
+          curl -sf localhost:8080/metrics | grep -q pulsebridge_ingest_total
+          docker compose exec -T worker-1 wget -qO- http://localhost:9100/metrics \
+            | grep -q pulsebridge_worker_processed_total
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

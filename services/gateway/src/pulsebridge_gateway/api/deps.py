@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import AsyncIterator
 
-from redis.asyncio import Redis
+from redis.asyncio import BlockingConnectionPool, Redis
 
 from pulsebridge_gateway.application.ingest import IngestEventUseCase
 from pulsebridge_gateway.infrastructure.memory import (
@@ -46,9 +46,28 @@ async def build_container(settings: Settings | None = None) -> AppContainer:
         )
         return AppContainer(settings=settings, redis=None, ingest=ingest)
 
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    # BlockingConnectionPool rather than the default pool. The default raises
+    # "Too many connections" the instant the pool is exhausted, which turns a
+    # short burst into 503s even though a connection would have freed up
+    # milliseconds later. Blocking with a bounded timeout absorbs the burst and
+    # still refuses to queue without limit: past the timeout the request fails,
+    # loudly and quickly, instead of piling up.
+    pool = BlockingConnectionPool.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        max_connections=settings.redis_max_connections,
+        timeout=settings.redis_pool_timeout_seconds,
+        socket_timeout=settings.redis_socket_timeout_seconds,
+        socket_connect_timeout=settings.redis_connect_timeout_seconds,
+    )
+    redis = Redis(connection_pool=pool)
+
     ingest = IngestEventUseCase(
-        publisher=RedisStreamPublisher(redis, stream_key=settings.stream_key),
+        publisher=RedisStreamPublisher(
+            redis,
+            stream_key=settings.stream_key,
+            max_len=settings.stream_max_len,
+        ),
         idempotency=RedisIdempotencyStore(redis),
         rate_limiter=RedisTokenBucketLimiter(redis, rps=settings.rate_limit_rps),
         idempotency_ttl_seconds=settings.idempotency_ttl_seconds,
@@ -56,9 +75,9 @@ async def build_container(settings: Settings | None = None) -> AppContainer:
     return AppContainer(settings=settings, redis=redis, ingest=ingest)
 
 
-async def lifespan_container() -> AsyncIterator[AppContainer]:
+async def lifespan_container(settings: Settings | None = None) -> AsyncIterator[AppContainer]:
     global _container
-    container = await build_container()
+    container = await build_container(settings)
     _container = container
     try:
         yield container

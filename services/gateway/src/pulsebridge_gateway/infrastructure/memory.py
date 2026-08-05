@@ -26,6 +26,10 @@ class InMemoryIdempotencyStore:
             self._keys[key] = time.monotonic() + ttl_seconds
             return True
 
+    async def forget(self, event_id: EventId) -> None:
+        async with self._lock:
+            self._keys.pop(str(event_id), None)
+
     def _purge(self) -> None:
         now = time.monotonic()
         expired = [k for k, exp in self._keys.items() if exp <= now]

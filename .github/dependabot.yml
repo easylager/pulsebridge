@@ -1,0 +1,39 @@
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /services/gateway
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the OpenTelemetry family: their versions move together and
+      # splitting them produces PRs that cannot pass CI on their own.
+      opentelemetry:
+        patterns: ["opentelemetry-*"]
+      dev-tooling:
+        patterns: ["ruff", "mypy", "pytest*", "jsonschema"]
+
+  - package-ecosystem: gomod
+    directory: /services/worker
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      opentelemetry:
+        patterns: ["go.opentelemetry.io/*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: docker
+    directory: /services/gateway
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: docker
+    directory: /services/worker
+    schedule:
+      interval: monthly
