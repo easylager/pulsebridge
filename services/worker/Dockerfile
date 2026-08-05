@@ -1,6 +1,6 @@
 # Build stage. go.mod and go.sum are copied first so the dependency layer is
 # reused whenever only application code changes.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
